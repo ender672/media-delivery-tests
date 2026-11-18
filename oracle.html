@@ -1,0 +1,262 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>playback oracle</title>
+<video id="v" preload="metadata" style="width: 427px"></video>
+<pre id="status"></pre>
+<script>
+  // Plays the video named in case.json, records what was presented and what
+  // the element reported, and posts the record to /result.
+  const video = document.getElementById("v");
+  const status = document.getElementById("status");
+  const t0 = performance.now();
+  const now = () => Math.round(performance.now() - t0);
+  const record = { events: [], frames: [], samples: [], actions: [], renderGaps: [], paints: [], unreadable: 0 };
+  const RENDER_LATE_MS = 100;
+  const PAINT_POLL_MS = 10;
+  let config;
+  let done = false;
+
+  const EVENTS = [
+    "loadstart", "loadedmetadata", "loadeddata", "suspend", "stalled", "play",
+    "waiting", "playing", "canplay", "canplaythrough", "seeking", "seeked",
+    "pause", "ratechange", "ended", "error",
+  ];
+
+  function ranges(r) {
+    return Array.from({ length: r.length }, (_, i) => [+r.start(i).toFixed(3), +r.end(i).toFixed(3)]);
+  }
+
+  function bufferedEnd() {
+    const b = video.buffered;
+    return b.length ? +b.end(b.length - 1).toFixed(3) : 0;
+  }
+
+  // End of the buffered range holding currentTime, or 0 if it is in none.
+  function bufferedAhead() {
+    const b = video.buffered;
+    const t = video.currentTime;
+    for (let i = 0; i < b.length; i++) {
+      if (b.start(i) <= t + 0.05 && t <= b.end(i)) {
+        return +b.end(i).toFixed(3);
+      }
+    }
+    return 0;
+  }
+
+  // Reads the frame number that make_clip.py draws along the top of its
+  // clips. Returns null for a video without one or a strip it cannot read.
+  function makeBarcodeReader(barcode) {
+    if (!barcode) {
+      return () => null;
+    }
+    const cell = 4;
+    const canvas = new OffscreenCanvas(barcode.bits * cell, 8);
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+    return () => {
+      if (!video.videoWidth) {
+        return null;
+      }
+      const strip = video.videoHeight * barcode.strip;
+      ctx.drawImage(video, 0, 0, video.videoWidth, strip, 0, 0, canvas.width, canvas.height);
+      const px = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+      const lit = (x, y) => px[(y * canvas.width + x) * 4] > 128;
+      let value = 0;
+      for (let i = 0; i < barcode.bits; i++) {
+        const x = i * cell + cell / 2;
+        const top = lit(x, 2);
+        if (top === lit(x, 6)) {
+          return null;
+        }
+        if (top) {
+          value += 2 ** i;
+        }
+      }
+      return value;
+    };
+  }
+
+  function watch() {
+    const barcode = config.video.barcode;
+    const readBarcode = makeBarcodeReader(barcode);
+    for (const type of EVENTS) {
+      video.addEventListener(type, () => {
+        record.events.push([now(), type, +video.currentTime.toFixed(3)]);
+        if (type === "ended") {
+          finish("ended");
+        } else if (type === "error") {
+          finish("error");
+        }
+      });
+    }
+
+    // One entry per presented frame: wall ms, the frame's media time,
+    // currentTime when it was presented, the frame number read from the
+    // picture (null without a barcode), how many ms after the callback's
+    // own time the picture had been read, and how many of those the reading
+    // took.
+    const onFrame = (time, metadata) => {
+      if (done) {
+        return;
+      }
+      const began = performance.now();
+      const code = readBarcode();
+      if (code === null && barcode) {
+        record.unreadable++;
+      }
+      record.frames.push([
+        Math.round(time - t0),
+        +metadata.mediaTime.toFixed(4),
+        +video.currentTime.toFixed(3),
+        code,
+        Math.round(performance.now() - time),
+        Math.round(performance.now() - began),
+      ]);
+      video.requestVideoFrameCallback(onFrame);
+    };
+    video.requestVideoFrameCallback(onFrame);
+
+    // Frame callbacks run when the page is given an animation frame. Where
+    // one asked for with each sample took RENDER_LATE_MS or more, [asked,
+    // came] says no frame callback could have run in between.
+    const askForFrame = () => {
+      const asked = now();
+      requestAnimationFrame(() => {
+        if (now() - asked >= RENDER_LATE_MS) {
+          record.renderGaps.push([asked, now()]);
+        }
+      });
+    };
+
+    // Every 100 ms: [wall ms, currentTime, readyState, networkState, paused,
+    // end of buffered, end of the buffered range holding currentTime].
+    setInterval(() => {
+      if (done) {
+        return;
+      }
+      askForFrame();
+      record.samples.push([
+        now(),
+        +video.currentTime.toFixed(3),
+        video.readyState,
+        video.networkState,
+        video.paused ? 1 : 0,
+        bufferedEnd(),
+        bufferedAhead(),
+      ]);
+    }, 100);
+
+    // [wall ms, frames the compositor has put up, frames handed to it],
+    // whenever either has changed. Needs no animation frame to be read.
+    let counted = "";
+    setInterval(() => {
+      const row = [now(), video.mozPaintedFrames ?? null, video.mozPresentedFrames ?? null];
+      if (!done && row[1] !== null && `${row[1]},${row[2]}` !== counted) {
+        counted = `${row[1]},${row[2]}`;
+        record.paints.push(row);
+      }
+    }, PAINT_POLL_MS);
+  }
+
+  // An action is {at: {wall: s after play} | {media: s}, do, to | value, fast}.
+  // Each is logged as [wall ms, what, currentTime before, argument, fast,
+  // and for a seek the seekable ranges then and how many frames had been
+  // recorded].
+  function runAction(action) {
+    const row = [now(), action.do, +video.currentTime.toFixed(3),
+                 action.to ?? action.value ?? null, !!action.fast];
+    if (action.do === "seek") {
+      row.push(ranges(video.seekable), record.frames.length);
+    }
+    record.actions.push(row);
+    switch (action.do) {
+      case "seek":
+        if (action.fast) {
+          video.fastSeek(action.to);
+        } else {
+          video.currentTime = action.to;
+        }
+        break;
+      case "pause":
+        video.pause();
+        break;
+      case "play":
+        video.play().catch(() => {});
+        break;
+      case "rate":
+        video.playbackRate = action.value;
+        break;
+      case "busy": {
+        const until = performance.now() + action.value * 1000;
+        while (performance.now() < until) {}
+        break;
+      }
+    }
+  }
+
+  // Wall-clock actions run on timers; media-time actions run in order, each
+  // once playback first reaches its time.
+  function scheduleActions(actions) {
+    const byMedia = [];
+    for (const action of actions) {
+      if (action.at.wall !== undefined) {
+        setTimeout(() => runAction(action), action.at.wall * 1000);
+      } else {
+        byMedia.push(action);
+      }
+    }
+    const timer = setInterval(() => {
+      while (byMedia.length && video.currentTime >= byMedia[0].at.media) {
+        runAction(byMedia.shift());
+      }
+      if (!byMedia.length) {
+        clearInterval(timer);
+      }
+    }, 20);
+  }
+
+  function finish(how) {
+    if (done) {
+      return;
+    }
+    done = true;
+    const q = video.getVideoPlaybackQuality();
+    record.finished = how;
+    record.duration = video.duration;
+    record.currentTime = video.currentTime;
+    record.error = video.error ? video.error.message || String(video.error.code) : null;
+    record.quality = { total: q.totalVideoFrames, dropped: q.droppedVideoFrames };
+    record.userAgent = navigator.userAgent;
+    status.textContent = `${how}: ${record.frames.length} frames`;
+    fetch("/result", { method: "POST", body: JSON.stringify(record) });
+  }
+
+  async function main() {
+    config = await (await fetch("case.json")).json();
+    watch();
+    // The server is told the moment play() is called, because a `lead`
+    // delivery is timed from it.
+    video.addEventListener(config.playOn || "loadeddata", () => {
+      setTimeout(() => {
+        record.playAt = now();
+        fetch("/mark?play", { method: "POST", keepalive: true }).catch(() => {});
+        video.play().catch(e => {
+          record.playError = String(e);
+          finish("play-rejected");
+        });
+        scheduleActions(config.actions || []);
+        setTimeout(() => finish("timeout"), config.maxPlayMs);
+      }, config.playDelayMs);
+    }, { once: true });
+    setTimeout(() => {
+      if (record.playAt === undefined) {
+        finish("never-loaded");
+      }
+    }, config.maxLoadMs);
+    video.src = config.src;
+  }
+
+  main().catch(e => {
+    status.textContent = String(e);
+    fetch("/result", { method: "POST", body: JSON.stringify({ finished: "page-error", error: String(e) }) });
+  });
+</script>

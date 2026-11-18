@@ -1,0 +1,5 @@
+# Everything a run produces. Nothing here is needed to rerun a case.
+/results/
+/runs/
+/clips/
+__pycache__/
